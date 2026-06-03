@@ -300,6 +300,14 @@ class BinanceClient:
                         return result
                     except requests.exceptions.HTTPError:
                         continue
+            if '-1109' in body:
+                # Same demo "Invalid account" quirk as marginType — leverage can't
+                # be changed here. Report the target so sizing proceeds; if the
+                # account's actual leverage is lower the order-placement retry
+                # logic (-2019/-4005/-2027 halving) corrects the quantity.
+                log.warning(f"{symbol}: leverage returned -1109 (demo quirk) — "
+                            f"assuming {leverage}x for sizing")
+                return {'leverage': leverage}
             raise
 
     def set_margin_type(self, symbol: str, margin_type: str = 'ISOLATED') -> dict:
@@ -317,6 +325,16 @@ class BinanceClient:
             if '-1121' in body:
                 # Symbol doesn't exist on this futures endpoint
                 raise ValueError(f"{symbol} not listed on futures demo")
+            if '-1109' in body:
+                # "Invalid account" — a Binance DEMO quirk on /v1/marginType for
+                # certain symbols (often newer/tokenized perps). The symbol is
+                # still tradeable; margin-type just can't be changed here. Treat
+                # as non-fatal and proceed with the order in the account's current
+                # margin mode (it may already be ISOLATED). On LIVE this branch
+                # rarely fires; if it does, the order placement still applies SL/TP.
+                log.warning(f"{symbol}: marginType returned -1109 (demo quirk) — "
+                            f"proceeding without changing margin type")
+                return {}
             raise
         except Exception:
             raise
@@ -846,23 +864,26 @@ class OrderManager:
         symbol    = signal.symbol
         direction = signal.direction
         strategy  = signal.strategy
+        is_limit  = getattr(signal, 'entry_type', 'MARKET') == 'LIMIT'
 
         with self._lock:
-            # Fix #4 — per-bar correlated entry cap
-            # Aligns the signal's candle timestamp to a 15m bar boundary, then
-            # counts how many new entries have already been opened in this bar.
-            # When EMA crossovers fire on multiple correlated alts at once
-            # (e.g. a market-wide pump or dump), this prevents opening 4-5
-            # positions that all stop out together on the next reversal tick.
-            bar_ts = (signal.signal_ts // BAR_INTERVAL_MS) * BAR_INTERVAL_MS
-            if bar_ts != self._current_bar_ts:
-                self._current_bar_ts        = bar_ts
-                self._entries_in_current_bar = 0
-            if self._entries_in_current_bar >= MAX_NEW_POSITIONS_PER_BAR:
-                log.info(f"[SKIP] {symbol}: per-bar entry cap reached "
-                         f"({self._entries_in_current_bar}/{MAX_NEW_POSITIONS_PER_BAR}) "
-                         f"— too many correlated signals this candle")
-                return
+            # Per-bar correlated entry cap — applies to MARKET entries only.
+            # When momentum signals fire on many correlated alts in the same 15m
+            # candle, this stops us opening a cluster of positions that all stop
+            # out together. LIMIT (ICT) signals are exempt: they are resting
+            # orders, one per coin per day, and a whole day's worth legitimately
+            # fires on the candle that opens the new gap — throttling them would
+            # silently drop most ICT coins.
+            if not is_limit:
+                bar_ts = (signal.signal_ts // BAR_INTERVAL_MS) * BAR_INTERVAL_MS
+                if bar_ts != self._current_bar_ts:
+                    self._current_bar_ts        = bar_ts
+                    self._entries_in_current_bar = 0
+                if self._entries_in_current_bar >= MAX_NEW_POSITIONS_PER_BAR:
+                    log.info(f"[SKIP] {symbol}: per-bar entry cap reached "
+                             f"({self._entries_in_current_bar}/{MAX_NEW_POSITIONS_PER_BAR}) "
+                             f"— too many correlated signals this candle")
+                    return
 
             total_open = len(self._open_positions) + len(self._pending_symbols)
             if total_open >= MAX_OPEN_POSITIONS:
@@ -884,10 +905,11 @@ class OrderManager:
                 log.info(f"[SKIP] {symbol}: entry already in progress")
                 return
             self._pending_symbols.add(symbol)
-            self._entries_in_current_bar += 1
+            if not is_limit:
+                self._entries_in_current_bar += 1
 
         # ── LIMIT-entry strategies (ICT) take a separate, non-blocking path ───
-        if getattr(signal, 'entry_type', 'MARKET') == 'LIMIT':
+        if is_limit:
             try:
                 self._handle_limit_signal(signal)
             finally:
